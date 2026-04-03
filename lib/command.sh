@@ -110,20 +110,10 @@ ccd_command_loop() {
 
         case "$cmd" in
             d|diff)
-                # Stage all changes so VS Code SCM picks them up
+                # Stage all changes so VS Code SCM panel picks them up automatically
                 docker exec "$container_name" sh -c 'cd /workspace && git add -A' 2>/dev/null || true
-                # Debug: check for vscode-server process
-                echo "[ccd] DEBUG: checking for vscode-server in container..."
-                docker exec "$container_name" sh -c 'ps aux 2>/dev/null | grep -i "vscode\|code-server" | grep -v grep || echo "(no vscode processes found)"'
-                # If VS Code is attached, open the diff there
                 if _ccd_is_vscode_attached "$container_name"; then
-                    echo "[ccd] Opening diff in VS Code..."
-                    local hex
-                    hex=$(printf '%s' "$container_name" | xxd -p | tr -d '\n')
-                    # Open the git diff view in VS Code
-                    code --folder-uri "vscode-remote://attached-container+${hex}/workspace" \
-                         --goto /workspace 2>/dev/null || true
-                    # Also show summary in terminal
+                    echo "[ccd] Changes staged — check VS Code Source Control panel."
                     docker exec "$container_name" git -C /workspace diff --stat ccd-snapshot
                 else
                     ccd_diff "$session_name" "$args"

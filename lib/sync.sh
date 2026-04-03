@@ -219,6 +219,14 @@ ccd_sync() {
 
     echo "[ccd] Applying patch to $host_project_path..."
     echo "$patch" | (cd "$host_project_path" && git apply --stat - && echo "$patch" | git apply -)
+
+    # Commit inside the container and move the snapshot tag forward
+    # so future diffs only show changes since this sync
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    docker exec "$container_name" sh -c "
+        cd /workspace && git add -A && git commit -q -m 'ccd: synced $timestamp' && git tag -f ccd-snapshot
+    "
     echo "[ccd] Sync complete."
 }
 

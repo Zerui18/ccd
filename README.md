@@ -1,4 +1,4 @@
-# ccd
+# Containerized Claude Code (ccd)
 
 Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) inside Docker containers with `--dangerously-skip-permissions`, fully isolated from your host filesystem.
 
