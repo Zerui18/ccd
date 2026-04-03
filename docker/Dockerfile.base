@@ -12,7 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo \
     procps \
     less \
-    && rm -rf /var/lib/apt/lists/*
+    tmux \
+    locales \
+    && rm -rf /var/lib/apt/lists/* \
+    && sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen \
+    && locale-gen
 
 # Use the existing 'node' user (uid 1000) from the base image — matches official devcontainer
 # Create workspace and config directories
@@ -22,9 +26,11 @@ RUN mkdir -p /workspace /home/node/.claude && \
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
-# Copy entrypoint
+# Copy entrypoint and tmux config
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY tmux.conf /home/node/.tmux.conf
+RUN chown node:node /home/node/.tmux.conf
 
 USER node
 WORKDIR /workspace
@@ -35,5 +41,7 @@ RUN git config --global user.name "ccd" && \
     git config --global init.defaultBranch main
 
 ENV CLAUDE_CONFIG_DIR=/home/node/.claude
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

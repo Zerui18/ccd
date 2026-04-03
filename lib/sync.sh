@@ -36,17 +36,12 @@ _copy_in_git() {
     local project_path="$1"
     local container_name="$2"
 
-    # 1. Bundle the entire repo and clone it inside the container
-    echo "[ccd]   Bundling git repo..."
-    (cd "$project_path" && git bundle create - --all) | \
-        docker exec -i "$container_name" sh -c '
-            git clone /dev/stdin /workspace 2>/dev/null || {
-                # /workspace exists but is empty — clone into temp then move
-                git clone /dev/stdin /tmp/_ccd_clone 2>/dev/null
-                cp -a /tmp/_ccd_clone/. /workspace/
-                rm -rf /tmp/_ccd_clone
-            }
-        '
+    # 1. Copy .git directory into the container, then checkout
+    echo "[ccd]   Copying git repo..."
+    # Tar the .git dir from host and extract as the container user (avoids ownership issues)
+    tar cf - --no-xattrs --no-mac-metadata -C "$project_path" .git | \
+        docker exec -i "$container_name" tar xf - -C /workspace
+    docker exec "$container_name" sh -c 'cd /workspace && git checkout HEAD -- .'
 
     # 2. Capture uncommitted changes from the host working tree
     local has_staged=false

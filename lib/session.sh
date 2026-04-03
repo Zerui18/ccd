@@ -84,7 +84,7 @@ ccd_clean_sessions() {
     echo "[ccd] Done."
 }
 
-# Attach to a running session
+# Attach to a running session (via tmux) and enter command loop on detach
 # Usage: ccd_attach_session <session_name>
 ccd_attach_session() {
     local session_name="$1"
@@ -98,5 +98,13 @@ ccd_attach_session() {
         return 1
     fi
 
-    docker attach "$container"
+    # Attach to tmux session inside the container
+    _ccd_tmux_attach "$container"
+
+    # After detach/return, check if Claude is still running
+    if docker exec "$container" tmux has-session -t ccd 2>/dev/null; then
+        ccd_command_loop "$session_name"
+    else
+        echo "[ccd] Claude session has ended."
+    fi
 }

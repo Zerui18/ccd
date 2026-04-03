@@ -9,38 +9,105 @@ source "$CCD_DIR/lib/sync.sh"
 source "$CCD_DIR/lib/session.sh"
 # shellcheck source=lib/stack.sh
 source "$CCD_DIR/lib/stack.sh"
+# shellcheck source=lib/command.sh
+source "$CCD_DIR/lib/command.sh"
 
 usage() {
     cat <<EOF
 ccd — Dockerized Claude Code with full filesystem isolation
 
 Usage:
-  ccd run <project-path> [options] [-- claude-args...]
+  ccd run <project-path> [options] [-- claude-args...]    (r)
   ccd ls
-  ccd diff <session> [path]
-  ccd sync <session> [--path <glob>]
+  ccd diff <session> [path]                               (d)
+  ccd sync <session> [--path <glob>]                      (s)
   ccd cp <session> <container-path> [host-path]
-  ccd attach <session>
+  ccd attach <session>                                    (a)
+  ccd open <session>                                      (o)
   ccd rm <session>
   ccd clean
-  ccd build [--force] [--stack <name>]
+  ccd build [--force] [--stack <name>]                    (b)
+  ccd auth <status|reset|seed>
 
 Options for 'run':
   --stack <name>      Override auto-detected stack (base, node, python, go, rust)
   --auth <method>     Force auth method: key, oauth (default: auto)
   --name <name>       Custom session name
-  --print             Print the prompt to pass to Claude Code and exit (non-interactive)
+  --prefix <key>      Tmux prefix key after Ctrl- (default: a)
+  --vscode            Auto-open VS Code attached to container
+  --print             Print mode (non-interactive, no tmux)
   -p <prompt>         Prompt to pass to Claude Code (non-interactive)
 
 Examples:
   ccd run ./my-app                          # Auto-detect stack, interactive
   ccd run ./my-app -p "fix all tests"       # Non-interactive with prompt
-  ccd run ./api --stack python              # Force Python stack
-  ccd diff myapp-a3f2                        # View changes
-  ccd sync myapp-a3f2                        # Apply changes to host
-  ccd sync myapp-a3f2 --path "src/*"         # Sync only src/ changes
+  ccd run ./api --stack python --vscode     # Python stack + VS Code
+  ccd diff myapp-a3f2                       # View changes
+  ccd sync myapp-a3f2                       # Apply changes to host
+  ccd sync myapp-a3f2 --path "src/*"        # Sync only src/ changes
 EOF
 }
+
+# --- Auth volume management ---
+
+CCD_AUTH_VOLUME="ccd-auth"
+
+# Seed the auth volume from host ~/.claude if it's empty
+_ccd_seed_auth_volume() {
+    local needs_seed
+    needs_seed=$(docker run --rm -v "$CCD_AUTH_VOLUME:/auth" alpine sh -c \
+        'test -d /auth && ls /auth/ 2>/dev/null | grep -q . && echo no || echo yes' 2>/dev/null || echo "yes")
+
+    if [ "$needs_seed" = "yes" ]; then
+        echo "[ccd] Seeding auth volume from host ~/.claude..."
+        docker run --rm \
+            -v "$CCD_AUTH_VOLUME:/auth" \
+            -v "$HOME/.claude:/host:ro" \
+            alpine sh -c 'cp -a /host/. /auth/ && chown -R 1000:1000 /auth'
+    fi
+}
+
+cmd_auth() {
+    local action="${1:-status}"
+    case "$action" in
+        status)
+            if docker volume inspect "$CCD_AUTH_VOLUME" >/dev/null 2>&1; then
+                local has_creds
+                has_creds=$(docker run --rm -v "$CCD_AUTH_VOLUME:/auth" alpine sh -c \
+                    'ls /auth/ 2>/dev/null | head -5')
+                if [ -n "$has_creds" ]; then
+                    echo "[ccd] Auth volume exists with credentials."
+                    echo "$has_creds"
+                else
+                    echo "[ccd] Auth volume exists but is empty."
+                fi
+            else
+                echo "[ccd] Auth volume does not exist (will be created on first run)."
+            fi
+            ;;
+        reset)
+            echo "[ccd] Removing auth volume..."
+            docker volume rm "$CCD_AUTH_VOLUME" 2>/dev/null || true
+            echo "[ccd] Done. Next run will prompt for login."
+            ;;
+        seed)
+            if [ ! -d "$HOME/.claude" ]; then
+                echo "[ccd] ERROR: ~/.claude not found"
+                exit 1
+            fi
+            docker volume rm "$CCD_AUTH_VOLUME" 2>/dev/null || true
+            _ccd_seed_auth_volume
+            echo "[ccd] Auth volume seeded from host."
+            ;;
+        *)
+            echo "[ccd] ERROR: Unknown auth action: $action"
+            echo "Usage: ccd auth <status|reset|seed>"
+            exit 1
+            ;;
+    esac
+}
+
+# --- Run command ---
 
 cmd_run() {
     local project_path=""
@@ -50,6 +117,8 @@ cmd_run() {
     local prompt=""
     local claude_args=
     local print_mode=false
+    local vscode_mode=false
+    local prefix_key=""
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -57,6 +126,8 @@ cmd_run() {
             --stack)    stack="$2"; shift 2 ;;
             --auth)     auth="$2"; shift 2 ;;
             --name)     session_name="$2"; shift 2 ;;
+            --prefix)   prefix_key="$2"; shift 2 ;;
+            --vscode)   vscode_mode=true; shift ;;
             --print)    print_mode=true; shift ;;
             -p)         prompt="$2"; shift 2 ;;
             --)         shift; claude_args=("$@"); break ;;
@@ -122,7 +193,7 @@ cmd_run() {
         --security-opt=no-new-privileges
     )
 
-    # Auth setup — determine method, actual copying happens after container create
+    # Auth setup
     local auth_method=""
     case "$auth" in
         key)
@@ -153,6 +224,22 @@ cmd_run() {
             ;;
     esac
 
+    # Auth volume for OAuth
+    if [ "$auth_method" = "oauth" ]; then
+        docker_args+=(-v "$CCD_AUTH_VOLUME:/home/node/.claude")
+        _ccd_seed_auth_volume
+    fi
+
+    # Tmux mode for interactive sessions
+    if [ "$print_mode" = false ]; then
+        docker_args+=(-e CCD_TMUX=1)
+    fi
+
+    # Custom prefix key
+    if [ -n "$prefix_key" ]; then
+        docker_args+=(-e "CCD_PREFIX_KEY=$prefix_key")
+    fi
+
     # Add prompt if provided
     local final_claude_args=()
     if [ -n "${claude_args+x}" ]; then
@@ -166,17 +253,19 @@ cmd_run() {
         final_claude_args+=(--print)
     fi
 
-    # Determine interactive flags
-    local tty_args=(-i)
-    if [ -t 0 ] && [ "$print_mode" = false ]; then
-        tty_args+=(-t)
+    # Determine TTY flags
+    local tty_args=()
+    if [ "$print_mode" = true ]; then
+        tty_args=(-i)  # stdin pipe for print mode
+    else
+        tty_args=(-t)  # tmux needs a TTY
     fi
 
     echo "[ccd] Starting session: $session_name"
     echo "[ccd] Project: $project_path"
     echo "[ccd] Stack: $stack | Image: $image"
 
-    # Create container (don't start yet — we need to copy files first)
+    # Create container
     docker create \
         "${docker_args[@]}" \
         "${tty_args[@]}" \
@@ -186,35 +275,50 @@ cmd_run() {
     # Start container in background
     docker start "$container_name" >/dev/null
 
-    # Copy OAuth credentials into container (writable, so Claude can update them)
-    if [ "$auth_method" = "oauth" ]; then
-        echo "[ccd] Copying auth credentials into container..."
-        # Copy ~/.claude directory
-        docker cp "$HOME/.claude" "$container_name:/home/node/.claude"
-        # Copy ~/.claude.json if it exists
-        if [ -f "$HOME/.claude.json" ]; then
-            docker cp "$HOME/.claude.json" "$container_name:/home/node/.claude.json"
-        fi
-        # Fix ownership (docker cp creates files as root)
-        docker exec -u root "$container_name" chown -R node:node /home/node/.claude /home/node/.claude.json 2>/dev/null || true
+    # Copy ~/.claude.json per-container (prefs, not auth tokens)
+    if [ "$auth_method" = "oauth" ] && [ -f "$HOME/.claude.json" ]; then
+        docker cp "$HOME/.claude.json" "$container_name:/home/node/.claude.json"
+        docker exec -u root "$container_name" chown node:node /home/node/.claude.json 2>/dev/null || true
     fi
 
     # Copy project files in
     ccd_copy_in "$project_path" "$session_name" "$stack"
 
-    echo "[ccd] Session started. Attaching..."
-    echo "[ccd] When done, use 'ccd diff $session_name' to review changes."
-    echo ""
+    # Auto-open VS Code if requested
+    if [ "$vscode_mode" = true ]; then
+        _ccd_vscode_attach "$container_name"
+    fi
 
-    # Attach to the container
-    docker attach "$container_name" || true
+    if [ "$print_mode" = true ]; then
+        # Non-interactive: just wait for completion
+        docker wait "$container_name" >/dev/null
+        docker logs "$container_name"
+    else
+        echo "[ccd] Session started. Press Ctrl-a d to enter command mode."
+        echo ""
 
-    echo ""
-    echo "[ccd] Session ended. Container preserved."
-    echo "[ccd] Review changes:  ccd diff $session_name"
-    echo "[ccd] Sync to host:    ccd sync $session_name"
-    echo "[ccd] Remove session:  ccd rm $session_name"
+        # Wait briefly for tmux to initialize
+        sleep 1
+
+        # Attach to tmux inside the container
+        _ccd_tmux_attach "$container_name"
+
+        # Check if Claude exited or user detached
+        if docker exec "$container_name" tmux has-session -t ccd 2>/dev/null; then
+            # User detached — enter command mode
+            ccd_command_loop "$session_name"
+        else
+            # Claude exited
+            echo ""
+            echo "[ccd] Claude session ended."
+            echo "[ccd] Review changes:  ccd diff $session_name"
+            echo "[ccd] Sync to host:    ccd sync $session_name"
+            echo "[ccd] Remove session:  ccd rm $session_name"
+        fi
+    fi
 }
+
+# --- Other commands ---
 
 cmd_ls() {
     ccd_list_sessions
@@ -285,6 +389,17 @@ cmd_attach() {
     ccd_attach_session "$session"
 }
 
+cmd_open() {
+    local session="${1:-}"
+    if [ -z "$session" ]; then
+        echo "[ccd] ERROR: Session name required"
+        exit 1
+    fi
+    local container_name
+    container_name=$(ccd_container_name "$session")
+    _ccd_vscode_attach "$container_name"
+}
+
 cmd_rm() {
     local session="${1:-}"
     if [ -z "$session" ]; then
@@ -314,17 +429,20 @@ cmd_build() {
     echo "[ccd] Build complete: $(ccd_image_name "$stack")"
 }
 
-# Main dispatch
+# --- Main dispatch (with shorthands) ---
+
 case "${1:-}" in
-    run)     shift; cmd_run "$@" ;;
-    ls)      shift; cmd_ls "$@" ;;
-    diff)    shift; cmd_diff "$@" ;;
-    sync)    shift; cmd_sync "$@" ;;
-    cp)      shift; cmd_cp "$@" ;;
-    attach)  shift; cmd_attach "$@" ;;
-    rm)      shift; cmd_rm "$@" ;;
-    clean)   shift; cmd_clean "$@" ;;
-    build)   shift; cmd_build "$@" ;;
+    r|run)       shift; cmd_run "$@" ;;
+    ls)          shift; cmd_ls "$@" ;;
+    d|diff)      shift; cmd_diff "$@" ;;
+    s|sync)      shift; cmd_sync "$@" ;;
+    cp)          shift; cmd_cp "$@" ;;
+    a|attach)    shift; cmd_attach "$@" ;;
+    o|open)      shift; cmd_open "$@" ;;
+    rm)          shift; cmd_rm "$@" ;;
+    clean)       shift; cmd_clean "$@" ;;
+    b|build)     shift; cmd_build "$@" ;;
+    auth)        shift; cmd_auth "$@" ;;
     -h|--help|help|"")
         usage
         ;;

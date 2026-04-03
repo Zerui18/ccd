@@ -32,5 +32,39 @@ if [ -f "$WORKSPACE/.ccd-setup.sh" ]; then
     git tag -f ccd-snapshot
 fi
 
+# Override tmux prefix key if configured
+if [ -n "${CCD_PREFIX_KEY:-}" ]; then
+    tmux set-option -g prefix "C-${CCD_PREFIX_KEY}" 2>/dev/null || true
+fi
+
+# Build the Claude command wrapper script (preserves argument quoting through tmux)
+cat > /tmp/ccd-run.sh <<RUNCMD
+#!/bin/bash
+exec claude --dangerously-skip-permissions $(printf '%q ' "$@")
+RUNCMD
+chmod +x /tmp/ccd-run.sh
+
+# Launch: via tmux (interactive) or directly (print/pipe mode)
 echo "[ccd] Starting Claude Code..."
-exec claude --dangerously-skip-permissions "$@"
+if [ "${CCD_TMUX:-0}" = "1" ]; then
+    echo "[ccd] Press Ctrl-a d to enter command mode."
+    # Start tmux in background — entrypoint stays alive as PID 1
+    # so the container survives tmux restarts (needed for reload)
+    tmux -f /home/node/.tmux.conf new-session -d -s ccd /tmp/ccd-run.sh
+
+    # Wait for tmux to exit (Claude quit or session killed)
+    # Re-check in a loop so reloads can start a new tmux session
+    while true; do
+        if ! tmux has-session -t ccd 2>/dev/null; then
+            # tmux session gone — check if a new one appeared (reload case)
+            sleep 1
+            if ! tmux has-session -t ccd 2>/dev/null; then
+                # No new session after 1s — Claude truly exited
+                break
+            fi
+        fi
+        sleep 1
+    done
+else
+    exec /tmp/ccd-run.sh
+fi
