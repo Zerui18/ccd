@@ -43,6 +43,10 @@ _copy_in_git() {
         docker exec -i "$container_name" tar xf - -C /workspace
     docker exec "$container_name" sh -c 'cd /workspace && git checkout HEAD -- .'
 
+    # Remove all remotes — container git is for snapshot tracking only
+    docker exec "$container_name" sh -c \
+        'cd /workspace && git remote | xargs -r -n1 git remote remove'
+
     # 2. Capture uncommitted changes from the host working tree
     local has_staged=false
     local has_unstaged=false
