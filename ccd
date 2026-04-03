@@ -1,0 +1,336 @@
+#!/bin/bash
+set -euo pipefail
+
+CCD_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# shellcheck source=lib/sync.sh
+source "$CCD_DIR/lib/sync.sh"
+# shellcheck source=lib/session.sh
+source "$CCD_DIR/lib/session.sh"
+# shellcheck source=lib/stack.sh
+source "$CCD_DIR/lib/stack.sh"
+
+usage() {
+    cat <<EOF
+ccd — Dockerized Claude Code with full filesystem isolation
+
+Usage:
+  ccd run <project-path> [options] [-- claude-args...]
+  ccd ls
+  ccd diff <session> [path]
+  ccd sync <session> [--path <glob>]
+  ccd cp <session> <container-path> [host-path]
+  ccd attach <session>
+  ccd rm <session>
+  ccd clean
+  ccd build [--force] [--stack <name>]
+
+Options for 'run':
+  --stack <name>      Override auto-detected stack (base, node, python, go, rust)
+  --auth <method>     Force auth method: key, oauth (default: auto)
+  --name <name>       Custom session name
+  --print             Print the prompt to pass to Claude Code and exit (non-interactive)
+  -p <prompt>         Prompt to pass to Claude Code (non-interactive)
+
+Examples:
+  ccd run ./my-app                          # Auto-detect stack, interactive
+  ccd run ./my-app -p "fix all tests"       # Non-interactive with prompt
+  ccd run ./api --stack python              # Force Python stack
+  ccd diff myapp-a3f2                        # View changes
+  ccd sync myapp-a3f2                        # Apply changes to host
+  ccd sync myapp-a3f2 --path "src/*"         # Sync only src/ changes
+EOF
+}
+
+cmd_run() {
+    local project_path=""
+    local stack=""
+    local auth="auto"
+    local session_name=""
+    local prompt=""
+    local claude_args=
+    local print_mode=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --stack)    stack="$2"; shift 2 ;;
+            --auth)     auth="$2"; shift 2 ;;
+            --name)     session_name="$2"; shift 2 ;;
+            --print)    print_mode=true; shift ;;
+            -p)         prompt="$2"; shift 2 ;;
+            --)         shift; claude_args=("$@"); break ;;
+            -*)         claude_args=("${claude_args[@]+"${claude_args[@]}"}" "$1"); shift ;;
+            *)
+                if [ -z "$project_path" ]; then
+                    project_path="$1"
+                else
+                    claude_args=("${claude_args[@]+"${claude_args[@]}"}" "$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$project_path" ]; then
+        echo "[ccd] ERROR: Project path is required"
+        usage
+        exit 1
+    fi
+
+    project_path=$(realpath "$project_path")
+    if [ ! -d "$project_path" ]; then
+        echo "[ccd] ERROR: $project_path is not a directory"
+        exit 1
+    fi
+
+    # Auto-detect stack if not specified
+    if [ -z "$stack" ]; then
+        stack=$(ccd_detect_stack "$project_path")
+        echo "[ccd] Detected stack: $stack"
+    fi
+
+    # Build the image
+    ccd_build_stack "$stack"
+
+    # Determine image to use
+    local image
+    if [ "$stack" = "base" ] || ! docker image inspect "ccd-${stack}:latest" >/dev/null 2>&1; then
+        image="ccd-base:latest"
+    else
+        image="ccd-${stack}:latest"
+    fi
+
+    # Generate session name
+    if [ -z "$session_name" ]; then
+        session_name=$(ccd_session_name "$project_path")
+    fi
+
+    local container_name
+    container_name=$(ccd_container_name "$session_name")
+
+    # Build docker run arguments
+    local docker_args=(
+        --name "$container_name"
+        --hostname "ccd-$(basename "$project_path")"
+        --label "ccd.managed=true"
+        --label "ccd.project=$(basename "$project_path")"
+        --label "ccd.project_path=$project_path"
+        --label "ccd.stack=$stack"
+        --user node
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+    )
+
+    # Auth setup — determine method, actual copying happens after container create
+    local auth_method=""
+    case "$auth" in
+        key)
+            if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+                echo "[ccd] ERROR: ANTHROPIC_API_KEY not set"
+                exit 1
+            fi
+            docker_args+=(-e ANTHROPIC_API_KEY)
+            auth_method="key"
+            ;;
+        oauth)
+            if [ ! -d "$HOME/.claude" ]; then
+                echo "[ccd] ERROR: ~/.claude not found for OAuth"
+                exit 1
+            fi
+            auth_method="oauth"
+            ;;
+        auto)
+            if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+                docker_args+=(-e ANTHROPIC_API_KEY)
+                auth_method="key"
+            elif [ -d "$HOME/.claude" ]; then
+                auth_method="oauth"
+            else
+                echo "[ccd] ERROR: No auth method available. Set ANTHROPIC_API_KEY or log in to Claude."
+                exit 1
+            fi
+            ;;
+    esac
+
+    # Add prompt if provided
+    local final_claude_args=()
+    if [ -n "${claude_args+x}" ]; then
+        final_claude_args+=("${claude_args[@]}")
+    fi
+    if [ -n "$prompt" ]; then
+        final_claude_args+=(-p "$prompt")
+    fi
+
+    if [ "$print_mode" = true ]; then
+        final_claude_args+=(--print)
+    fi
+
+    # Determine interactive flags
+    local tty_args=(-i)
+    if [ -t 0 ] && [ "$print_mode" = false ]; then
+        tty_args+=(-t)
+    fi
+
+    echo "[ccd] Starting session: $session_name"
+    echo "[ccd] Project: $project_path"
+    echo "[ccd] Stack: $stack | Image: $image"
+
+    # Create container (don't start yet — we need to copy files first)
+    docker create \
+        "${docker_args[@]}" \
+        "${tty_args[@]}" \
+        "$image" \
+        ${final_claude_args[@]+"${final_claude_args[@]}"} >/dev/null
+
+    # Start container in background
+    docker start "$container_name" >/dev/null
+
+    # Copy OAuth credentials into container (writable, so Claude can update them)
+    if [ "$auth_method" = "oauth" ]; then
+        echo "[ccd] Copying auth credentials into container..."
+        # Copy ~/.claude directory
+        docker cp "$HOME/.claude" "$container_name:/home/node/.claude"
+        # Copy ~/.claude.json if it exists
+        if [ -f "$HOME/.claude.json" ]; then
+            docker cp "$HOME/.claude.json" "$container_name:/home/node/.claude.json"
+        fi
+        # Fix ownership (docker cp creates files as root)
+        docker exec -u root "$container_name" chown -R node:node /home/node/.claude /home/node/.claude.json 2>/dev/null || true
+    fi
+
+    # Copy project files in
+    ccd_copy_in "$project_path" "$session_name" "$stack"
+
+    echo "[ccd] Session started. Attaching..."
+    echo "[ccd] When done, use 'ccd diff $session_name' to review changes."
+    echo ""
+
+    # Attach to the container
+    docker attach "$container_name" || true
+
+    echo ""
+    echo "[ccd] Session ended. Container preserved."
+    echo "[ccd] Review changes:  ccd diff $session_name"
+    echo "[ccd] Sync to host:    ccd sync $session_name"
+    echo "[ccd] Remove session:  ccd rm $session_name"
+}
+
+cmd_ls() {
+    ccd_list_sessions
+}
+
+cmd_diff() {
+    local session="${1:-}"
+    local path_filter="${2:-}"
+
+    if [ -z "$session" ]; then
+        echo "[ccd] ERROR: Session name required"
+        exit 1
+    fi
+
+    ccd_diff "$session" "$path_filter"
+}
+
+cmd_sync() {
+    local session=""
+    local path_filter=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --path) path_filter="$2"; shift 2 ;;
+            *)
+                if [ -z "$session" ]; then
+                    session="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$session" ]; then
+        echo "[ccd] ERROR: Session name required"
+        exit 1
+    fi
+
+    local project_path
+    project_path=$(ccd_get_project_path "$session")
+    if [ -z "$project_path" ]; then
+        echo "[ccd] ERROR: Could not determine project path for $session"
+        exit 1
+    fi
+
+    ccd_sync "$session" "$project_path" "$path_filter"
+}
+
+cmd_cp() {
+    local session="${1:-}"
+    local container_path="${2:-}"
+    local host_path="${3:-.}"
+
+    if [ -z "$session" ] || [ -z "$container_path" ]; then
+        echo "[ccd] ERROR: Usage: ccd cp <session> <container-path> [host-path]"
+        exit 1
+    fi
+
+    ccd_cp "$session" "$container_path" "$host_path"
+}
+
+cmd_attach() {
+    local session="${1:-}"
+    if [ -z "$session" ]; then
+        echo "[ccd] ERROR: Session name required"
+        exit 1
+    fi
+    ccd_attach_session "$session"
+}
+
+cmd_rm() {
+    local session="${1:-}"
+    if [ -z "$session" ]; then
+        echo "[ccd] ERROR: Session name required"
+        exit 1
+    fi
+    ccd_remove_session "$session"
+}
+
+cmd_clean() {
+    ccd_clean_sessions
+}
+
+cmd_build() {
+    local force=""
+    local stack="base"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force="--force"; shift ;;
+            --stack) stack="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    ccd_build_stack "$stack" "$force"
+    echo "[ccd] Build complete: $(ccd_image_name "$stack")"
+}
+
+# Main dispatch
+case "${1:-}" in
+    run)     shift; cmd_run "$@" ;;
+    ls)      shift; cmd_ls "$@" ;;
+    diff)    shift; cmd_diff "$@" ;;
+    sync)    shift; cmd_sync "$@" ;;
+    cp)      shift; cmd_cp "$@" ;;
+    attach)  shift; cmd_attach "$@" ;;
+    rm)      shift; cmd_rm "$@" ;;
+    clean)   shift; cmd_clean "$@" ;;
+    build)   shift; cmd_build "$@" ;;
+    -h|--help|help|"")
+        usage
+        ;;
+    *)
+        echo "[ccd] Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac

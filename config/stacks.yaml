@@ -1,0 +1,48 @@
+# Stack definitions for ccd
+# Each stack extends the base image with language-specific tooling
+
+stacks:
+  base:
+    description: "Minimal — Node.js + Claude Code only"
+    dockerfile: docker/Dockerfile.base
+    detect: []
+
+  node:
+    description: "Node.js + TypeScript + pnpm/yarn"
+    dockerfile: docker/stacks/node.Dockerfile
+    detect:
+      - package.json
+    setup: |
+      if [ -f package-lock.json ]; then npm ci
+      elif [ -f yarn.lock ]; then yarn install --frozen-lockfile
+      elif [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+      elif [ -f package.json ]; then npm install
+      fi
+
+  python:
+    description: "Python 3 + uv package manager"
+    dockerfile: docker/stacks/python.Dockerfile
+    detect:
+      - pyproject.toml
+      - uv.lock
+      - requirements.txt
+    setup: |
+      if [ -f uv.lock ] || [ -f pyproject.toml ]; then uv sync
+      elif [ -f requirements.txt ]; then uv pip install -r requirements.txt
+      fi
+
+  go:
+    description: "Go 1.23 toolchain"
+    dockerfile: docker/stacks/go.Dockerfile
+    detect:
+      - go.mod
+    setup: |
+      if [ -f go.mod ]; then go mod download; fi
+
+  rust:
+    description: "Rust + Cargo"
+    dockerfile: docker/stacks/rust.Dockerfile
+    detect:
+      - Cargo.toml
+    setup: |
+      if [ -f Cargo.toml ]; then cargo fetch; fi
