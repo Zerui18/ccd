@@ -6,6 +6,28 @@ SNAPSHOT_MARKER="$WORKSPACE/.ccd-initialized"
 
 cd "$WORKSPACE"
 
+# Link shared auth credentials into container-local .claude directory
+# The auth volume is mounted at ~/.claude-auth; projects/sessions stay local
+CLAUDE_DIR="/home/node/.claude"
+AUTH_DIR="/home/node/.claude-auth"
+if [ -d "$AUTH_DIR" ]; then
+    mkdir -p "$CLAUDE_DIR"
+    # Symlink auth-related files from the shared volume (including dotfiles)
+    for f in "$AUTH_DIR"/* "$AUTH_DIR"/.*; do
+        # Skip . and ..
+        case "$(basename "$f")" in .|..) continue ;; esac
+        base=$(basename "$f")
+        # Skip per-container dirs — keep those local
+        case "$base" in
+            projects|sessions|session-env|file-history|shell-snapshots|plans|debug|ide|plugins) continue ;;
+        esac
+        # Don't overwrite existing local files
+        if [ ! -e "$CLAUDE_DIR/$base" ]; then
+            ln -sf "$f" "$CLAUDE_DIR/$base"
+        fi
+    done
+fi
+
 # Wait for files to be copied in (happens after container start via docker exec)
 if [ ! -f "$SNAPSHOT_MARKER" ]; then
     echo "[ccd] Waiting for project files..."

@@ -224,9 +224,10 @@ cmd_run() {
             ;;
     esac
 
-    # Auth volume for OAuth
+    # Auth volume for OAuth — mount at staging path, entrypoint links auth files
+    # This keeps projects/sessions/history container-local
     if [ "$auth_method" = "oauth" ]; then
-        docker_args+=(-v "$CCD_AUTH_VOLUME:/home/node/.claude")
+        docker_args+=(-v "$CCD_AUTH_VOLUME:/home/node/.claude-auth")
         _ccd_seed_auth_volume
     fi
 

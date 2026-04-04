@@ -65,6 +65,7 @@ ccd_build_base() {
     docker build \
         -t "$image" \
         --label "ccd.build_hash=$build_hash" \
+        --build-arg "CACHE_BUST=$(date +%s)" \
         -f "$DOCKER_DIR/Dockerfile.base" \
         "$DOCKER_DIR"
 }

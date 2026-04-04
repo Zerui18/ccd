@@ -23,12 +23,13 @@ ccd_container_name() {
 # List all ccd sessions (strips the ccd- container prefix for display)
 # Usage: ccd_list_sessions
 ccd_list_sessions() {
-    docker ps -a \
-        --filter "label=$CCD_LABEL" \
-        --format "{{.Names}}\t{{.Status}}\t{{.Label \"ccd.project\"}}\t{{.Label \"ccd.stack\"}}\t{{.CreatedAt}}" | \
-        sed 's/^ccd-//' | \
-        column -t -s $'\t' | \
-        (echo "NAME  STATUS  PROJECT  STACK  CREATED" && cat)
+    (
+        echo "NAME	STATUS	PROJECT	STACK	CREATED"
+        docker ps -a \
+            --filter "label=$CCD_LABEL" \
+            --format "{{.Names}}	{{.Status}}	{{.Label \"ccd.project\"}}	{{.Label \"ccd.stack\"}}	{{.CreatedAt}}" | \
+            sed 's/^ccd-//'
+    ) | column -t -s $'\t'
 }
 
 # Get the project path stored as a label on the container
